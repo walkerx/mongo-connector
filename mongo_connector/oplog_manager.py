@@ -395,6 +395,15 @@ class OplogThread(threading.Thread):
             # Field does not exactly match any key in the update doc.
             return list(find_partial_matches())
 
+    @classmethod
+    def _copy_matched_field(cls, doc, field, find_fields, new_doc):
+        for path, value in find_fields(field, doc):
+            temp_doc = new_doc
+            for p in path[:-1]:
+                temp_doc = temp_doc.setdefault(p, {})
+            temp_doc[path[-1]] = value
+        return new_doc
+
     def _pop_excluded_fields(self, doc, exclude_fields, update=False):
         # Remove all the fields that were passed in exclude_fields.
         find_fields = self._find_update_fields if update else self._find_field
@@ -410,15 +419,23 @@ class OplogThread(threading.Thread):
 
     def _copy_included_fields(self, doc, include_fields, update=False):
         new_doc = {}
-        find_fields = self._find_update_fields if update else self._find_field
         for field in include_fields:
-            for path, value in find_fields(field, doc):
-                # Copy each matching field in the original document.
-                temp_doc = new_doc
-                for p in path[:-1]:
-                    temp_doc = temp_doc.setdefault(p, {})
-                temp_doc[path[-1]] = value
-
+            box = field.split(':')
+            if len(box) != 2:
+                find_fields = self._find_update_fields if update else self._find_field
+                new_doc = self._copy_matched_field(doc, field, find_fields, new_doc)
+            else:
+                array_field, sub_fields = box[0], box[1].split(',')
+                if array_field in doc:  # 数组整体更新
+                    new_doc[array_field] = []
+                    for sub_doc in doc[array_field]:
+                        new_sub_doc = self._copy_included_fields(sub_doc, sub_fields, update)
+                        new_doc[array_field].append(new_sub_doc)
+                elif update:  # 数组单个元素更新
+                    for key in doc:
+                        for sub_field in sub_fields:
+                            if key.startswith(array_field) and key[len(array_field)] == '.' and key.endswith(sub_field):
+                                new_doc[key] = doc[key]
         return new_doc
 
     def filter_oplog_entry(self, entry, include_fields=None,
@@ -432,7 +449,8 @@ class OplogThread(threading.Thread):
             filter_fields = self._copy_included_fields
         else:
             filter_fields = self._pop_excluded_fields
-
+        LOG.info("begin:")
+        LOG.info(entry)
         fields = include_fields or exclude_fields
         entry_o = entry['o']
         # 'i' indicates an insert. 'o' field is the doc to be inserted.
@@ -453,12 +471,14 @@ class OplogThread(threading.Thread):
             if "$unset" in entry_o and not entry_o['$unset']:
                 entry_o.pop("$unset")
             if not entry_o:
+                LOG.info("result: 没有需要更新的字段")
                 return None
         # 'u' indicates an update. The 'o' field is the replacement document
         # if no '$set' or '$unset' are present.
         elif entry['op'] == 'u':
             entry['o'] = filter_fields(entry_o, fields)
-
+        LOG.info("result:")
+        LOG.info(entry)
         return entry
 
     def get_oplog_cursor(self, timestamp=None):
@@ -535,10 +555,22 @@ class OplogThread(threading.Thread):
 
         LOG.debug("OplogThread: Dumping set of collections %s " % dump_set)
 
+        def projection_for_array(p):
+            result = {}
+            for field in p:
+                box = field.split(':')
+                if len(box) == 2:
+                    for item in box[1].split(','):
+                        result[box[0] + '.' + item] = 1
+                else:
+                    result[field] = p[field]
+            return result
+
         def docs_to_dump(from_coll):
             last_id = None
             attempts = 0
             projection = self.namespace_config.projection(from_coll.full_name)
+            projection = projection_for_array(projection)
             # Loop to handle possible AutoReconnect
             while attempts < 60:
                 if last_id is None:
