@@ -434,7 +434,7 @@ class OplogThread(threading.Thread):
                 elif update:  # 数组单个元素更新
                     for key in doc:
                         for sub_field in sub_fields:
-                            if key.startswith(array_field) and key[len(array_field)] == '.' and key.endswith(sub_field):
+                            if key.startswith(array_field + '.') and key.endswith('.' + sub_field):
                                 new_doc[key] = doc[key]
         return new_doc
 
